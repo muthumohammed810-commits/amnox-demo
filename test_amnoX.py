@@ -97,24 +97,56 @@ class MarketplaceIntegration(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM am_schema_migrations").fetchone()[0], 2)
 
     def test_portal_pages_enforce_roles_on_server(self):
-        # Dashboard paths redirect unauthenticated users on the server.
-        for path, login_path in (("/admin/dashboard", "/admin/login"), ("/shop/dashboard", "/shop/login"), ("/delivery/dashboard", "/delivery/login")):
+        # Canonical portal roots serve the application, which chooses login vs dashboard by session.
+        for path in ("/admin", "/shop", "/delivery"):
+            with self.client.open(self.base + path, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn(b"AMNOX", response.read())
+
+        # Legacy entry and dashboard links safely consolidate to the canonical URL.
+        for path, canonical in (("/admin/login", "/admin"), ("/admin/dashboard", "/admin"),
+                                ("/shop/login", "/shop"), ("/shop/dashboard", "/shop"),
+                                ("/delivery/login", "/delivery"), ("/delivery/dashboard", "/delivery")):
             req = urllib.request.Request(self.base + path)
             with self.assertRaises(urllib.error.HTTPError) as response:
                 urllib.request.build_opener(NoRedirectHandler()).open(req, timeout=5)
-            self.assertEqual(response.exception.code, 303)
-            self.assertEqual(response.exception.headers.get("Location"), login_path)
+            self.assertEqual(response.exception.code, 302)
+            self.assertEqual(response.exception.headers.get("Location"), canonical)
             response.exception.close()
 
         self.login("operator@example.test")
-        with self.client.open(self.base + "/admin/dashboard", timeout=5) as response:
+        with self.client.open(self.base + "/admin", timeout=5) as response:
             self.assertEqual(response.status, 200)
         shop_client = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
         self.login("seller@example.test", shop_client)
         with self.assertRaises(urllib.error.HTTPError) as denied:
-            shop_client.open(self.base + "/admin/dashboard", timeout=5)
+            shop_client.open(self.base + "/admin", timeout=5)
         self.assertEqual(denied.exception.code, 403)
         denied.exception.close()
+
+    def test_canonical_portals_require_their_own_role(self):
+        clients = {
+            "admin": self.client,
+            "shop": urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())),
+            "rider": urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())),
+        }
+        for email, client in (("operator@example.test", clients["admin"]),
+                              ("seller@example.test", clients["shop"]),
+                              ("rider@example.test", clients["rider"])):
+            self.login(email, client)
+
+        for role, path in (("admin", "/admin"), ("shop", "/shop"), ("rider", "/delivery")):
+            with clients[role].open(self.base + path, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+
+        for role, forbidden_path in (("admin", "/shop"), ("admin", "/delivery"),
+                                     ("shop", "/admin"), ("shop", "/delivery"),
+                                     ("rider", "/admin"), ("rider", "/shop")):
+            with self.subTest(role=role, path=forbidden_path):
+                with self.assertRaises(urllib.error.HTTPError) as denied:
+                    clients[role].open(self.base + forbidden_path, timeout=5)
+                self.assertEqual(denied.exception.code, 403)
+                denied.exception.close()
 
     def test_production_does_not_seed_demo_shops_or_products(self):
         old_path, old_seed = server.DB_PATH, server.SEED_DEMO_DATA
@@ -161,7 +193,7 @@ class MarketplaceIntegration(unittest.TestCase):
         previous = server.APP_ENV
         server.APP_ENV = "demo"
         try:
-            for path in ("/", "/admin/login", "/shop/login", "/delivery/login"):
+            for path in ("/", "/admin", "/shop", "/delivery"):
                 with urllib.request.urlopen(self.base + path, timeout=5) as response:
                     self.assertEqual(response.status, 200)
             for path, payload in (
@@ -178,8 +210,8 @@ class MarketplaceIntegration(unittest.TestCase):
                     protected.open(req, timeout=5)
                     self.fail("Unauthenticated portal dashboard unexpectedly returned normally.")
                 except urllib.error.HTTPError as response:
-                    self.assertEqual(response.code, 303)
-                    self.assertEqual(response.headers["Location"], f"/{portal}/login")
+                    self.assertEqual(response.code, 302)
+                    self.assertEqual(response.headers["Location"], f"/{portal}")
                     response.read()
                     response.close()
         finally:

@@ -387,6 +387,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             path = urlparse(self.path).path
+            # Keep historical deep links usable, but consolidate portal entry and
+            # overview URLs onto one role-specific canonical location.
+            portal_aliases = {
+                "/admin/login": "/admin", "/admin/dashboard": "/admin",
+                "/shop/login": "/shop", "/shop/dashboard": "/shop",
+                "/delivery/login": "/delivery", "/delivery/dashboard": "/delivery",
+            }
+            if path in portal_aliases:
+                self.send_response(302)
+                self.send_header("Location", portal_aliases[path])
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if path.startswith("/api/am/") or path.startswith("/api/auth/"):
                 return self.am_get(path)
             if path.startswith(("/api/restaurants", "/api/restaurant/", "/api/orders", "/api/dispatch", "/api/rider", "/api/admin")):
@@ -463,20 +477,29 @@ class Handler(BaseHTTPRequestHandler):
     def serve_static(self, urlpath):
         namespace = urlpath.strip("/").split("/", 1)[0]
         if namespace in {"admin", "shop", "delivery"}:
-            is_login = urlpath in {"/admin/login", "/shop/login", "/delivery/login"}
+            # Canonical roots serve the SPA, which chooses login vs dashboard
+            # from this same session. Authorization remains enforced here too.
+            is_portal_root = urlpath in {"/admin", "/shop", "/delivery"}
             is_public_registration = urlpath == "/shop/register"
-            if not is_login and not is_public_registration:
+            if not is_portal_root and not is_public_registration:
                 required_role = {"admin": "admin", "shop": "shop", "delivery": "rider"}[namespace]
                 with connect() as db:
                     user = self.am_user(db)
                 if user is None:
                     self.send_response(303)
-                    self.send_header("Location", f"/{namespace}/login")
+                    self.send_header("Location", f"/{namespace}")
                     self.send_header("Cache-Control", "no-store")
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
                 if user["role"] != required_role:
+                    self.send_error(403, "This portal requires an authorized account.")
+                    return
+            elif is_portal_root:
+                required_role = {"admin": "admin", "shop": "shop", "delivery": "rider"}[namespace]
+                with connect() as db:
+                    user = self.am_user(db)
+                if user is not None and user["role"] != required_role:
                     self.send_error(403, "This portal requires an authorized account.")
                     return
         path = (ROOT / "web" / urlpath.lstrip("/")).resolve()
