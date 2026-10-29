@@ -4,10 +4,11 @@ AMNOX is a local-first multi-vendor marketplace for vegetables, fruits, permitte
 
 ## Run locally
 
-Requires Python 3.11+; there are no third-party Python dependencies.
+Requires Python 3.11+ and the dependency listed in `requirements.txt` (cryptography, used to encrypt delivery codes at rest).
 
 ```powershell
 cd C:\Users\DELL\Documents\Codex\2026-10-29\files-pasted-by-the-user-master\work
+python -m pip install -r requirements.txt
 python -u server.py
 ```
 
@@ -19,7 +20,11 @@ Open http://127.0.0.1:8000. The app listens on `HOST`/`PORT` environment setting
 
 To deploy, put this existing project in a Git repository accessible to your Render account, create a Render Blueprint from it, and apply `render.yaml`. The Docker image also defaults to `APP_ENV=demo`, `AMNOX_DB_PATH=/tmp/amnox-demo.sqlite3`, and synthetic demo seeding so a service created outside a Blueprint still fails safely as DEMO ONLY. The service binds `0.0.0.0` on Render's `PORT` (configured as `10000`), runs `python /app/container-entrypoint.py`, and checks `/api/health`. It uses a new disposable database, seeds synthetic catalog entries, and rejects customer registration, shop applications, checkout, and legacy orders server-side. No local database is packaged: `.dockerignore` excludes `data/`, including `data/nila.sqlite3` and `data/verify.sqlite3`.
 
-The public demo has secure cookies, same-origin checks for POST requests, server-side portal authorization, and an in-process login throttle. It does not provision public test credentials; portal login forms are visible, while portal pages and APIs remain inaccessible without an explicitly provisioned role account. The rate limiter is process-local and resets on restart. Never use real customer information, credentials, or production secrets with the DEMO ONLY service.
+The public demo has secure cookies, same-origin checks for POST requests, server-side portal authorization, and an in-process login throttle. It does not provision public test credentials; portal login forms are visible, while portal pages and APIs remain inaccessible without an explicitly provisioned role account. Customer registration, checkout, and shop applications are disabled both in the UI and on the server. The rate limiter is process-local and resets on restart. Never use real customer information, credentials, or production secrets with the DEMO ONLY service.
+
+Customer sign-in keeps the password masked by default and includes an accessible visibility toggle. Customer passwords continue to use the existing PBKDF2-HMAC-SHA256 hashing. Password recovery is not implemented, so the sign-in page says so instead of presenting a nonfunctional reset link. Authenticated customers can place separate Cash on Delivery orders; stable idempotency keys prevent repeat submissions from duplicating an order. Order IDs are generated with collision-resistant random references, order history is scoped to the signed-in customer, and each order receives a separate six-digit cryptographic delivery code. The code is HMAC-verified and encrypted at rest; it is returned only in that customer's scoped order response, never in operator order payloads or logs. Delivery attempts are limited to five and the assigned rider must verify the code before the server records delivery.
+
+The OTP encryption key is intentionally not committed. Staging/production must provide a stable Fernet key in `AMNOX_OTP_ENCRYPTION_KEY` as a secret environment variable. Generate one with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Losing that key makes still-pending order codes unreadable; changing it without re-encrypting existing order codes causes new order creation to fail closed. Back up and rotate keys with a deliberate re-encryption procedure before taking orders. The free Render demo does not need this key because it rejects order creation and uses disposable storage.
 
 Before accepting any real orders: use a paid service with durable storage (or migrate SQLite/schema to managed PostgreSQL), provision verified operator accounts with unique strong credentials, configure durable sessions and distributed abuse controls, enable backups and restore checks, review the custom HTTP server and application security, and configure production secrets and HTTPS settings. Do not point the demo database path at the existing local database.
 
@@ -61,7 +66,7 @@ node --check web\amx.js
 python -m unittest -v test_amnoX
 ```
 
-Tests cover catalog routes, SPA route serving, customer registration, header-role escalation rejection, idempotent checkout, stock decrement and restoration, shop order isolation, rider assignment, delivery state transitions and OTP completion.
+Tests cover catalog routes, SPA route serving, customer registration, customer order privacy/history, repeated and multiple checkouts, unique order IDs and delivery codes, password visibility control wiring, header-role escalation rejection, stock decrement/restoration, shop isolation, rider assignment, delivery code rejection and replay protection.
 
 ## Data and security boundaries
 
@@ -70,7 +75,7 @@ Tests cover catalog routes, SPA route serving, customer registration, header-rol
 - Admin actions require a signed-in provisioned administrator. Shop API queries scope records to the account's linked shop. Riders see only assignments linked to their rider account. Customer order list access is scoped to the signed-in customer.
 - The app now has production-mode origin checks for POST requests, same-site secure cookies, server-side portal-route authorization, a basic per-IP-and-account login throttle, versioned additive SQLite migrations, and production demo-seed protection. These safeguards do not replace a security review, platform-level or distributed rate limiting, password recovery/email verification, automated backup/restore drills, formal retention controls, PostgreSQL for scale, or a hardened production HTTP server stack.
 - Account verification, private shop documents, media upload, address book CRUD, favorites, coupons, refunds, support tickets, commission/settlement ledger, and full category/settings management are not implemented yet.
-- Maps, live GPS, push/SMS/email, payment gateway, online payment, Android clients and APK builds are not configured. No live delivery estimate, payment charge, or external notification is claimed. OTP is local order verification with expiry and a five-attempt lockout.
+- Maps, live GPS, push/SMS/email, payment gateway, online payment, Android clients and APK builds are not configured. No live delivery estimate, payment charge, or external notification is claimed. OTP is per-order verification with a one-hour expiry, HMAC verification, encrypted storage, and a five-attempt lockout. OTP plaintext is not logged.
 - Legal, food safety, tax, consumer protection, privacy and local operating requirements require qualified review for Kerala/India.
 
 `server.py` contains the API and additive schema setup. `web/amx.js`, `web/amx.css` and `web/index.html` form the responsive client. `test_amnoX.py` is the focused integration suite. Local databases and runtime artifacts are ignored by Git.

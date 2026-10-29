@@ -11,6 +11,8 @@ import hashlib
 import hmac
 import getpass
 import sys
+import base64
+from cryptography.fernet import Fernet, InvalidToken
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,6 +38,28 @@ if APP_ENV == "demo" and not SEED_DEMO_DATA:
     raise RuntimeError("The public demo requires synthetic demo catalog seeding.")
 if APP_ENV in {"staging", "production"} and os.environ.get("AMNOX_SEED_DEMO_DATA", "false").lower() in {"1", "true", "yes"}:
     raise RuntimeError("Demo catalog seeding is allowed only in development or demo environments.")
+_otp_encryption_key = os.environ.get("AMNOX_OTP_ENCRYPTION_KEY")
+if APP_ENV in {"staging", "production"} and not _otp_encryption_key:
+    raise RuntimeError("Set AMNOX_OTP_ENCRYPTION_KEY to a stable Fernet key in hosted non-demo environments.")
+if _otp_encryption_key:
+    OTP_FERNET_KEY = _otp_encryption_key.encode("ascii")
+elif APP_ENV == "development":
+    # Keep local pending delivery codes decryptable across server restarts. This key
+    # stays beside the ignored local database and is never part of the source image.
+    _local_otp_key_path = DB_PATH.parent / ".amnox-otp-encryption.key"
+    _local_otp_key_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _key_fd = os.open(_local_otp_key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        OTP_FERNET_KEY = _local_otp_key_path.read_bytes().strip()
+    else:
+        with os.fdopen(_key_fd, "wb") as _key_file:
+            _key_file.write(Fernet.generate_key())
+        OTP_FERNET_KEY = _local_otp_key_path.read_bytes().strip()
+else:
+    OTP_FERNET_KEY = Fernet.generate_key()
+OTP_FERNET = Fernet(OTP_FERNET_KEY)
+OTP_HASH_KEY = hashlib.sha256(b"AMNOX delivery OTP verifier v1\0" + base64.urlsafe_b64decode(OTP_FERNET_KEY)).digest()
 LOCK = threading.RLock()
 LOGIN_LOCK = threading.Lock()
 LOGIN_FAILURES = defaultdict(deque)
@@ -53,6 +77,38 @@ class ClosingConnection(sqlite3.Connection):
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def otp_digest(code):
+    return hmac.new(OTP_HASH_KEY, code.encode("ascii"), hashlib.sha256).hexdigest()
+
+
+def generate_delivery_code(db):
+    # A six-digit namespace is finite. Refuse to reuse any code already issued.
+    rows = db.execute("SELECT delivery_otp_hash,delivery_otp_ciphertext FROM am_orders").fetchall()
+    existing = {r['delivery_otp_hash'] for r in rows}
+    existing_codes = set()
+    for row in rows:
+        if row['delivery_otp_ciphertext']:
+            try:
+                existing_codes.add(OTP_FERNET.decrypt(row['delivery_otp_ciphertext'].encode('ascii')).decode('ascii'))
+            except (InvalidToken, UnicodeDecodeError):
+                raise APIError("Pending delivery-code key does not match stored orders; restore the original key before accepting orders.", 503)
+    for _ in range(1_000_000):
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        keyed = otp_digest(code)
+        legacy = hashlib.sha256(code.encode("ascii")).hexdigest()
+        if code not in existing_codes and keyed not in existing and legacy not in existing:
+            return code, keyed
+    raise APIError("No unused delivery codes remain; contact the platform operator.", 503)
+
+
+def unique_order_reference(db):
+    for _ in range(100):
+        public_id = "AM-" + secrets.token_hex(8).upper()
+        if not db.execute("SELECT 1 FROM am_orders WHERE public_id=?", (public_id,)).fetchone():
+            return public_id
+    raise APIError("Could not allocate a unique order reference.", 503)
 
 
 def connect():
@@ -174,7 +230,7 @@ def initialize():
           delivery_address TEXT NOT NULL, instructions TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
           payment_method TEXT NOT NULL, payment_status TEXT NOT NULL, subtotal INTEGER NOT NULL,
           delivery_fee INTEGER NOT NULL, total INTEGER NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
-          delivery_otp_hash TEXT NOT NULL, otp_expires INTEGER NOT NULL, rider_user_id INTEGER,
+          delivery_otp_hash TEXT NOT NULL, delivery_otp_ciphertext TEXT, otp_expires INTEGER NOT NULL, rider_user_id INTEGER,
           otp_attempts INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
@@ -218,6 +274,13 @@ def initialize():
                 db.execute('ALTER TABLE am_orders ADD COLUMN otp_attempts INTEGER NOT NULL DEFAULT 0')
             db.execute("PRAGMA user_version=2")
             db.execute("INSERT OR IGNORE INTO am_schema_migrations(version,applied_at) VALUES(2,?)", (now(),))
+            version = 2
+        if version < 3:
+            order_columns={r['name'] for r in db.execute('PRAGMA table_info(am_orders)')}
+            if 'delivery_otp_ciphertext' not in order_columns:
+                db.execute('ALTER TABLE am_orders ADD COLUMN delivery_otp_ciphertext TEXT')
+            db.execute("PRAGMA user_version=3")
+            db.execute("INSERT OR IGNORE INTO am_schema_migrations(version,applied_at) VALUES(3,?)", (now(),))
         if SEED_DEMO_DATA and db.execute("SELECT COUNT(*) FROM restaurants").fetchone()[0] == 0:
             restaurants = [
                 ("Pepper & Palm", "Kerala", "Coastal Kerala cooking, rooted in Malabar spice and seasonal produce.", "Kozhikode", 2, 0, 1, 2500, 0, "", 24),
@@ -586,15 +649,13 @@ class Handler(BaseHTTPRequestHandler):
             cur = db.execute("INSERT INTO orders(public_id,customer_id,customer_name,customer_phone,address,instructions,restaurant_id,status,payment_method,payment_status,subtotal,delivery_fee,total,delivery_otp_hash,otp_expires,created_at,updated_at,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (public_id,customer_id,name,phone,address,instructions,rid,status,payment,payment_status,subtotal,fee,subtotal+fee,secrets.token_hex(32),int(time.time())+3600,now(),now(),key))
             oid = cur.lastrowid
-            # OTP plaintext is deliberately only displayed in local dev output; the API accepts a one-time code.
-            # A salted digest is stored below.
+            # Legacy endpoint is retired; keep any local data hashing separate from AMNOX OTPs.
             import hashlib
             db.execute("UPDATE orders SET delivery_otp_hash=? WHERE id=?", (hashlib.sha256(otp.encode()).hexdigest(), oid))
             for item, qty, note in order_items:
                 db.execute("INSERT INTO order_items(order_id,menu_item_id,item_name,unit_price,quantity,note) VALUES(?,?,?,?,?,?)", (oid,item["id"],item["name"],item["price"],qty,note))
             audit(db,self.role(),self.actor(),"order_created","order",public_id,{"payment_status":payment_status})
             order = db.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
-            if APP_ENV == "development": print(f"[local development only] Delivery verification code for {public_id}: {otp}")
             return self.send_json(order_payload(db,order), 201)
 
     def restaurant_action(self, public_id, data):
@@ -719,7 +780,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/am/orders':
                 user=self.am_require(db,'customer')
                 rows=db.execute('SELECT o.*,s.name shop_name FROM am_orders o JOIN shops s ON s.id=o.shop_id WHERE o.user_id=? ORDER BY o.id DESC LIMIT 100',(user['id'],)).fetchall()
-                return self.send_json({'items':[self.am_order_data(db,r) for r in rows]})
+                return self.send_json({'items':[self.am_customer_order_data(db,r,user) for r in rows]})
+            if path.startswith('/api/am/orders/'):
+                user=self.am_require(db,'customer'); public_id=path.rsplit('/',1)[1]
+                row=db.execute('SELECT o.*,s.name shop_name FROM am_orders o JOIN shops s ON s.id=o.shop_id WHERE o.public_id=? AND o.user_id=?',(public_id,user['id'])).fetchone()
+                if not row: raise APIError('Order not found.',404)
+                return self.send_json(self.am_customer_order_data(db,row,user))
             if path == '/api/am/shop/dashboard' or path == '/api/am/shop/products' or path == '/api/am/shop/orders':
                 user=self.am_require(db,'shop'); sid=user.get('shop_id')
                 if not sid: raise APIError('This shop account is not linked to an approved shop.',403)
@@ -740,7 +806,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/am/admin/audit':
                 self.am_require(db,'admin'); return self.send_json({'items':[dict(r) for r in db.execute('SELECT * FROM am_audit ORDER BY id DESC LIMIT 200')]})
             if path == '/api/am/customer/orders':
-                user=self.am_require(db,'customer'); rows=db.execute('SELECT o.*,s.name shop_name FROM am_orders o JOIN shops s ON s.id=o.shop_id WHERE o.user_id=? ORDER BY o.id DESC',(user['id'],)).fetchall(); return self.send_json({'items':[self.am_order_data(db,r) for r in rows]})
+                user=self.am_require(db,'customer'); rows=db.execute('SELECT o.*,s.name shop_name FROM am_orders o JOIN shops s ON s.id=o.shop_id WHERE o.user_id=? ORDER BY o.id DESC',(user['id'],)).fetchall(); return self.send_json({'items':[self.am_customer_order_data(db,r,user) for r in rows]})
             if path == '/api/am/admin/applications':
                 self.am_require(db,'admin'); return self.send_json({'items':[dict(r) for r in db.execute('SELECT * FROM shop_applications ORDER BY id DESC')]})
             if path == '/api/am/rider/assignments':
@@ -748,7 +814,28 @@ class Handler(BaseHTTPRequestHandler):
         raise APIError('AMNOX endpoint not found.',404)
 
     def am_order_data(self,db,row):
-        o=dict(row); o['items']=[dict(x) for x in db.execute('SELECT product_name,unit,unit_price,quantity_milli,line_total FROM am_order_items WHERE order_id=?',(o['id'],))]; o['total_display']=cents(o['total']); return o
+        o=dict(row)
+        for private_field in ('delivery_otp_hash','delivery_otp_ciphertext','otp_expires','otp_attempts'):
+            o.pop(private_field,None)
+        o['items']=[dict(x) for x in db.execute('SELECT product_name,unit,unit_price,quantity_milli,line_total FROM am_order_items WHERE order_id=?',(o['id'],))]
+        o['total_display']=cents(o['total'])
+        return o
+
+    def am_customer_order_data(self,db,row,user):
+        if row['user_id'] != user['id']:
+            raise APIError('Order not found.',404)
+        o=self.am_order_data(db,row)
+        labels={'placed':'Placed','accepted':'Accepted','packing':'Preparing','ready':'Preparing','assigned':'Out for Delivery','picked_up':'Out for Delivery','en_route':'Out for Delivery','delivered':'Delivered','cancelled':'Cancelled'}
+        o['customer_status']=labels.get(o['status'],'Processing')
+        code_row=db.execute('SELECT delivery_otp_ciphertext,otp_expires,status FROM am_orders WHERE id=? AND user_id=?',(row['id'],user['id'])).fetchone()
+        if code_row and code_row['delivery_otp_ciphertext'] and code_row['status'] not in ('delivered','cancelled') and int(time.time()) <= code_row['otp_expires']:
+            try:
+                o['delivery_code']=OTP_FERNET.decrypt(code_row['delivery_otp_ciphertext'].encode('ascii')).decode('ascii')
+            except (InvalidToken, UnicodeDecodeError):
+                o['delivery_code']=None
+        else:
+            o['delivery_code']=None
+        return o
 
     def am_post(self,path,data):
         if APP_ENV == "demo" and path in {"/api/auth/register", "/api/am/shop-applications", "/api/am/orders"}:
@@ -842,20 +929,28 @@ class Handler(BaseHTTPRequestHandler):
                 if busy: raise APIError('This rider already has an active delivery.',409)
                 db.execute('UPDATE am_orders SET rider_user_id=?,status=\'assigned\',updated_at=? WHERE id=?',(rider_id,now(),oid)); db.execute('INSERT INTO am_deliveries(order_id,rider_user_id,status,assigned_at) VALUES(?,?,?,?) ON CONFLICT(order_id) DO UPDATE SET rider_user_id=excluded.rider_user_id,status=excluded.status,assigned_at=excluded.assigned_at',(oid,rider_id,'assigned',now())); self.am_audit(db,user,'rider_assigned','order',oid,{'rider_user_id':rider_id}); return self.send_json({'ok':True})
             if path == '/api/am/rider/status':
-                user=self.am_require(db,'rider'); oid=int(data.get('order_id',0)); action=data.get('action'); order=db.execute('SELECT * FROM am_orders WHERE id=? AND rider_user_id=?',(oid,user['id'])).fetchone(); mapping={'picked_up':('assigned','picked_up'),'en_route':('picked_up','en_route')}
+                user=self.am_require(db,'rider'); oid=int(data.get('order_id',0)); action=data.get('action'); db.execute('BEGIN IMMEDIATE'); order=db.execute('SELECT * FROM am_orders WHERE id=? AND rider_user_id=?',(oid,user['id'])).fetchone(); mapping={'picked_up':('assigned','picked_up'),'en_route':('picked_up','en_route')}
                 if not order: raise APIError('Delivery assignment not found.',404)
                 if action=='complete':
-                    import hashlib as _hashlib
                     if order['status']!='en_route' or int(time.time())>order['otp_expires'] or order['otp_attempts']>=5: raise APIError('Delivery code is expired or locked after five attempts.',403)
-                    if not secrets.compare_digest(_hashlib.sha256(str(data.get('otp','')).encode()).hexdigest(),order['delivery_otp_hash']):
+                    submitted=str(data.get('otp',''))
+                    valid_format=len(submitted)==6 and submitted.isascii() and submitted.isdigit()
+                    valid_code=valid_format and secrets.compare_digest(otp_digest(submitted),order['delivery_otp_hash'])
+                    # Allow completion of pre-v3 locally provisioned orders; new codes always use keyed HMAC.
+                    if valid_format and not valid_code and not order['delivery_otp_ciphertext']:
+                        valid_code=secrets.compare_digest(hashlib.sha256(submitted.encode('ascii')).hexdigest(),order['delivery_otp_hash'])
+                    if not valid_code:
                         db.execute('UPDATE am_orders SET otp_attempts=otp_attempts+1 WHERE id=?',(oid,)); db.commit(); raise APIError('Delivery verification code is incorrect.',403)
-                    db.execute('UPDATE am_orders SET status=\'delivered\',updated_at=? WHERE id=?',(now(),oid)); db.execute("UPDATE am_deliveries SET status='delivered',delivered_at=? WHERE order_id=?",(now(),oid)); db.execute('INSERT INTO am_order_history(order_id,status,actor_user_id,created_at) VALUES(?,?,?,?)',(oid,'delivered',user['id'],now())); return self.send_json({'ok':True,'status':'delivered'})
+                    delivered_at=now(); db.execute('UPDATE am_orders SET status=\'delivered\',updated_at=? WHERE id=?',(delivered_at,oid)); db.execute("UPDATE am_deliveries SET status='delivered',delivered_at=? WHERE order_id=?",(delivered_at,oid)); db.execute('INSERT INTO am_order_history(order_id,status,actor_user_id,created_at) VALUES(?,?,?,?)',(oid,'delivered',user['id'],delivered_at)); self.am_audit(db,user,'delivery_code_verified','order',order['public_id'],{'result':'verified'}); return self.send_json({'ok':True,'status':'delivered','delivered_at':delivered_at})
                 if action not in mapping or order['status']!=mapping[action][0]: raise APIError('Delivery state transition is not allowed.',409)
                 new=mapping[action][1]; db.execute('UPDATE am_orders SET status=?,updated_at=? WHERE id=?',(new,now(),oid)); db.execute('UPDATE am_deliveries SET status=?,picked_at=CASE WHEN ?=\'picked_up\' THEN ? ELSE picked_at END WHERE order_id=?',(new,new,now(),oid)); db.execute('INSERT INTO am_order_history(order_id,status,actor_user_id,created_at) VALUES(?,?,?,?)',(oid,new,user['id'],now())); return self.send_json({'ok':True,'status':new})
         raise APIError('AMNOX action not found.',404)
 
     def am_create_order(self,data):
         if APP_ENV == "demo": raise APIError("This DEMO ONLY preview does not accept orders.", 403)
+        user = None
+        with connect() as db:
+            user=self.am_require(db,'customer')
         key=self.headers.get('Idempotency-Key','')[:100]
         if not key: raise APIError('Checkout needs an idempotency key.')
         name=str(data.get('name','')).strip()[:100]; phone=str(data.get('phone','')).strip()[:24]; address=str(data.get('address','')).strip()[:300]; instructions=str(data.get('instructions','')).strip()[:300]; shop_id=int(data.get('shop_id',0)); items=data.get('items')
@@ -864,15 +959,15 @@ class Handler(BaseHTTPRequestHandler):
         try: parsed=[(int(i['id']),int(i['quantity_milli'])) for i in items]
         except (ValueError,KeyError,TypeError): raise APIError('Basket quantities are invalid.')
         if any(q<250 or q>100000 for _,q in parsed) or len({pid for pid,_ in parsed})!=len(parsed): raise APIError('Check product quantities and remove duplicate lines.')
-        user=None
         with connect() as db:
-            user=self.am_user(db)
-            if user and user['role']!='customer': raise APIError('Use the customer account to place an order.',403)
             db.execute('BEGIN IMMEDIATE'); previous=db.execute('SELECT * FROM am_orders WHERE idempotency_key=?',(key,)).fetchone()
             if previous:
-                uid=user['id'] if user else None
+                uid=user['id']
                 if previous['user_id']!=uid: raise APIError('This idempotency key belongs to another checkout.',409)
-                return self.send_json(self.am_order_data(db,previous),200)
+                prior_items=sorted((r['product_id'],r['quantity_milli']) for r in db.execute('SELECT product_id,quantity_milli FROM am_order_items WHERE order_id=?',(previous['id'],)))
+                if (previous['shop_id']!=shop_id or previous['customer_name']!=name or previous['customer_phone']!=phone or previous['delivery_address']!=address or previous['instructions']!=instructions or previous['payment_method']!=str(data.get('payment_method','cod')) or prior_items!=sorted(parsed)):
+                    raise APIError('This idempotency key was already used for a different checkout.',409)
+                return self.send_json(self.am_customer_order_data(db,previous,user),200)
             shop=db.execute("SELECT * FROM shops WHERE id=? AND status='approved' AND is_open=1",(shop_id,)).fetchone()
             if not shop: raise APIError('This shop is unavailable for checkout.',409)
             subtotal=0; snapshots=[]
@@ -888,13 +983,13 @@ class Handler(BaseHTTPRequestHandler):
             if subtotal<shop['minimum_order']: raise APIError('Basket is below this shop\'s minimum order.',409)
             fee=shop['delivery_fee']; method=str(data.get('payment_method','cod'))
             if method!='cod': raise APIError('Only Cash on Delivery is currently configured.')
-            otp=f'{secrets.randbelow(1_000_000):06d}'; public='AM-'+secrets.token_hex(4).upper(); uid=user['id'] if user else None
-            cur=db.execute("INSERT INTO am_orders(public_id,user_id,shop_id,customer_name,customer_phone,delivery_address,instructions,status,payment_method,payment_status,subtotal,delivery_fee,total,idempotency_key,delivery_otp_hash,otp_expires,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'placed',?,'authorized_cod',?,?,?,?,?,?,?,?)",(public,uid,shop_id,name,phone,address,instructions,method,subtotal,fee,subtotal+fee,key,hashlib.sha256(otp.encode()).hexdigest(),int(time.time())+3600,now(),now())); oid=cur.lastrowid
+            otp,otp_hash=generate_delivery_code(db); otp_ciphertext=OTP_FERNET.encrypt(otp.encode('ascii')).decode('ascii'); public=unique_order_reference(db); uid=user['id']
+            created_at=now(); expires_at=int(time.time())+3600
+            cur=db.execute("INSERT INTO am_orders(public_id,user_id,shop_id,customer_name,customer_phone,delivery_address,instructions,status,payment_method,payment_status,subtotal,delivery_fee,total,idempotency_key,delivery_otp_hash,delivery_otp_ciphertext,otp_expires,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'placed',?,'authorized_cod',?,?,?,?,?,?,?,?,?)",(public,uid,shop_id,name,phone,address,instructions,method,subtotal,fee,subtotal+fee,key,otp_hash,otp_ciphertext,expires_at,created_at,created_at)); oid=cur.lastrowid
             for product,qty,price,line in snapshots:
                 db.execute('INSERT INTO am_order_items(order_id,product_id,product_name,unit,unit_price,quantity_milli,line_total) VALUES(?,?,?,?,?,?,?)',(oid,product['id'],product['name'],product['unit'],price,qty,line)); db.execute('INSERT INTO am_stock_moves(product_id,delta_milli,reason,created_at) VALUES(?,?,?,?)',(product['id'],-qty,'customer order '+public,now()))
-            db.execute('INSERT INTO am_order_history(order_id,status,created_at) VALUES(?,?,?)',(oid,'placed',now())); row=db.execute('SELECT o.*,s.name shop_name FROM am_orders o JOIN shops s ON s.id=o.shop_id WHERE o.id=?',(oid,)).fetchone()
-            if APP_ENV=='development': print(f'[AMNOX local development only] Delivery OTP for {public}: {otp}')
-            result=self.am_order_data(db,row); result['total']=subtotal+fee; return self.send_json(result,201)
+            db.execute('INSERT INTO am_order_history(order_id,status,created_at) VALUES(?,?,?)',(oid,'placed',created_at)); row=db.execute('SELECT o.*,s.name shop_name FROM am_orders o JOIN shops s ON s.id=o.shop_id WHERE o.id=?',(oid,)).fetchone()
+            result=self.am_customer_order_data(db,row,user); result['total']=subtotal+fee; return self.send_json(result,201)
 
 
 def main():

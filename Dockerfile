@@ -8,6 +8,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     AMNOX_SEED_DEMO_DATA=true
 
 WORKDIR /app
+COPY requirements.txt ./
+RUN python -m pip install --no-cache-dir -r requirements.txt
 RUN useradd --system --uid 10001 --no-create-home amnox \
     && mkdir -p /data \
     && chown 10001:10001 /data /app

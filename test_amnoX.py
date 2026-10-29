@@ -29,7 +29,7 @@ class MarketplaceIntegration(unittest.TestCase):
             self.product = db.execute("SELECT * FROM am_products WHERE shop_id=? ORDER BY id LIMIT 1", (self.shop_ids[0],)).fetchone()
             self.initial_stock = self.product["stock_milli"]
             salt = b"integration-test-salt"
-            for email, role, shop in (("operator@example.test", "admin", None), ("seller@example.test", "shop", self.shop_ids[0]), ("seller2@example.test", "shop", self.shop_ids[1]), ("rider@example.test", "rider", None)):
+            for email, role, shop in (("operator@example.test", "admin", None), ("seller@example.test", "shop", self.shop_ids[0]), ("seller2@example.test", "shop", self.shop_ids[1]), ("rider@example.test", "rider", None), ("customer@example.test", "customer", None), ("customer2@example.test", "customer", None)):
                 digest = hashlib.pbkdf2_hmac("sha256", b"test-password-123", salt, 180000).hex() + "$" + salt.hex()
                 db.execute("INSERT INTO am_users(email,name,role,password_hash,shop_id,created_at) VALUES(?,?,?,?,?,?)", (email, email.split('@')[0], role, digest, shop, server.now()))
         self.http = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
@@ -66,6 +66,7 @@ class MarketplaceIntegration(unittest.TestCase):
             return json.loads(res.read())
 
     def place_order(self, shop_id=None, key="stable-order-key"):
+        self.login("customer@example.test")
         shop_id = shop_id or self.shop_ids[0]
         product = self.product if shop_id == self.shop_ids[0] else None
         if product is None:
@@ -90,11 +91,18 @@ class MarketplaceIntegration(unittest.TestCase):
             self.assertEqual(req.status, 200)
             self.assertIn(b"AMNOX", req.read())
         html = urllib.request.urlopen(self.base + "/", timeout=5).read()
-        for link in (b'href="/categories"', b'href="/products"', b'href="/account/login"', b'href="/account"', b'href="/shop/login"', b'href="/delivery/login"', b'href="/admin/login"'):
+        for link in (b'href="/categories"', b'href="/products"', b'href="/account/login"', b'href="/account"'):
             self.assertIn(link, html)
+        for portal_link in (b'href="/shop/login"', b'href="/delivery/login"', b'href="/admin/login"'):
+            self.assertNotIn(portal_link, html)
+        js = urllib.request.urlopen(self.base + "/amx.js", timeout=5).read()
+        self.assertIn(b'id="password-toggle"', js)
+        self.assertIn(b'type="password"', js)
+        self.assertIn(b"input.type=show?'text':'password'", js)
+        self.assertIn(b'type="submit" class="button button-green full-width"', js)
         with server.connect() as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM am_schema_migrations").fetchone()[0], 2)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM am_schema_migrations").fetchone()[0], 3)
 
     def test_portal_pages_enforce_roles_on_server(self):
         # Canonical portal roots serve the application, which chooses login vs dashboard by session.
@@ -218,6 +226,7 @@ class MarketplaceIntegration(unittest.TestCase):
             server.APP_ENV = previous
 
     def test_checkout_rejects_oversell_and_invalid_pack_fraction(self):
+        self.login("customer@example.test")
         with server.connect() as db:
             db.execute("UPDATE am_products SET stock_milli=5000 WHERE id=?", (self.product["id"],))
         body = {"shop_id": self.shop_ids[0], "items": [{"id": self.product["id"], "quantity_milli": 6000}], "name": "Test Customer", "phone": "9876543210", "address": "12 Sample Road, Kochi", "payment_method": "cod"}
@@ -233,15 +242,119 @@ class MarketplaceIntegration(unittest.TestCase):
             self.assertEqual(stock, 5000)
 
     def test_customer_registration_idempotency_and_inventory(self):
-        self.request("/api/auth/register", "POST", {"name": "Customer One", "email": "customer@example.test", "password": "strong-password-1"}, expected=200)
+        self.request("/api/auth/register", "POST", {"name": "Customer One", "email": "new-customer@example.test", "password": "strong-password-1"}, expected=200)
         first = self.place_order()
         second = self.request("/api/am/orders", "POST", {"shop_id": self.shop_ids[0], "items": [{"id": self.product["id"], "quantity_milli": 1000}], "name": "Test Customer", "phone": "9876543210", "address": "12 Sample Road, Kochi", "payment_method": "cod"}, {"Idempotency-Key": "stable-order-key"}, 200)
         self.assertEqual(first["public_id"], second["public_id"])
+        changed = {"shop_id": self.shop_ids[0], "items": [{"id": self.product["id"], "quantity_milli": 1000}], "name": "Test Customer", "phone": "9876543210", "address": "99 Different Road, Kochi", "payment_method": "cod"}
+        result = self.request("/api/am/orders", "POST", changed, {"Idempotency-Key": "stable-order-key"}, 409)
+        self.assertIn("different checkout", result["error"])
         with server.connect() as db:
             stock = db.execute("SELECT stock_milli FROM am_products WHERE id=?", (self.product["id"],)).fetchone()[0]
             self.assertEqual(stock, self.initial_stock - 1000)
             snapshot = db.execute("SELECT product_name,unit_price FROM am_order_items WHERE order_id=?", (first["id"],)).fetchone()
             self.assertEqual(snapshot["product_name"], self.product["name"])
+
+    def test_customer_can_place_multiple_distinct_orders_with_unique_ids_and_codes(self):
+        first = self.place_order(key="first-order")
+        second = self.place_order(key="second-order")
+        self.assertNotEqual(first["public_id"], second["public_id"])
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertRegex(first["delivery_code"], r"^\d{6}$")
+        self.assertRegex(second["delivery_code"], r"^\d{6}$")
+        self.assertNotEqual(first["delivery_code"], second["delivery_code"])
+        history = self.request("/api/am/customer/orders")["items"]
+        self.assertEqual({first["public_id"], second["public_id"]}, {o["public_id"] for o in history})
+
+    def test_customer_order_privacy_and_private_otp_fields(self):
+        order = self.place_order(key="private-order")
+        self.assertIn("delivery_code", order)
+        for field in ("delivery_otp_hash", "delivery_otp_ciphertext", "otp_expires", "otp_attempts"):
+            self.assertNotIn(field, order)
+        other = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.login("customer2@example.test", other)
+        req = urllib.request.Request(self.base + f"/api/am/orders/{order['public_id']}")
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            other.open(req, timeout=5)
+        self.assertEqual(denied.exception.code, 404)
+        denied.exception.close()
+
+    def test_invalid_delivery_code_lockout_and_replay_protection(self):
+        order = self.place_order(key="otp-security")
+        self.request("/api/am/rider/status", "POST", {"order_id": order["id"], "action": "complete", "otp": order["delivery_code"]}, expected=403)
+        self.login("seller@example.test")
+        for action in ("accept", "packing", "ready"):
+            self.request(f"/api/am/shop/orders/{order['id']}", "POST", {"action": action})
+        self.login("operator@example.test")
+        rider = self.request("/api/am/admin/users?role=rider")["items"][0]
+        self.request(f"/api/am/admin/orders/{order['id']}", "POST", {"rider_user_id": rider["id"]})
+        self.login("rider@example.test")
+        for action in ("picked_up", "en_route"):
+            self.request("/api/am/rider/status", "POST", {"order_id": order["id"], "action": action})
+        bad = self.request("/api/am/rider/status", "POST", {"order_id": order["id"], "action": "complete", "otp": "000000"}, expected=403)
+        self.assertIn("incorrect", bad["error"])
+        self.request("/api/am/rider/status", "POST", {"order_id": order["id"], "action": "complete", "otp": order["delivery_code"]})
+        replay = self.request("/api/am/rider/status", "POST", {"order_id": order["id"], "action": "complete", "otp": order["delivery_code"]}, expected=403)
+        self.assertTrue("expired" in replay["error"].lower() or "locked" in replay["error"].lower())
+        with server.connect() as db:
+            row = db.execute("SELECT status FROM am_orders WHERE id=?", (order["id"],)).fetchone()
+            self.assertEqual(row["status"], "delivered")
+
+    def test_delivery_code_cannot_be_reused_across_orders(self):
+        first = self.place_order(key="otp-first-order")
+        second = self.place_order(key="otp-second-order")
+        self.login("seller@example.test")
+        for order in (first, second):
+            for action in ("accept", "packing", "ready"):
+                self.request(f"/api/am/shop/orders/{order['id']}", "POST", {"action": action})
+        self.login("operator@example.test")
+        rider = self.request("/api/am/admin/users?role=rider")["items"][0]
+        self.request(f"/api/am/admin/orders/{first['id']}", "POST", {"rider_user_id": rider["id"]})
+        self.login("rider@example.test")
+        for action in ("picked_up", "en_route"):
+            self.request("/api/am/rider/status", "POST", {"order_id": first["id"], "action": action})
+        denied = self.request("/api/am/rider/status", "POST", {"order_id": first["id"], "action": "complete", "otp": second["delivery_code"]}, expected=403)
+        self.assertIn("incorrect", denied["error"])
+        self.request("/api/am/rider/status", "POST", {"order_id": first["id"], "action": "complete", "otp": first["delivery_code"]})
+        with server.connect() as db:
+            self.assertEqual(db.execute("SELECT status FROM am_orders WHERE id=?", (first["id"],)).fetchone()[0], "delivered")
+            self.assertEqual(db.execute("SELECT status FROM am_orders WHERE id=?", (second["id"],)).fetchone()[0], "ready")
+
+    def test_expired_delivery_code_and_five_attempt_lockout(self):
+        order = self.place_order(key="otp-expiry-lockout")
+        self.login("seller@example.test")
+        for action in ("accept", "packing", "ready"):
+            self.request(f"/api/am/shop/orders/{order['id']}", "POST", {"action": action})
+        self.login("operator@example.test")
+        rider = self.request("/api/am/admin/users?role=rider")["items"][0]
+        self.request(f"/api/am/admin/orders/{order['id']}", "POST", {"rider_user_id": rider["id"]})
+        self.login("rider@example.test")
+        for action in ("picked_up", "en_route"):
+            self.request("/api/am/rider/status", "POST", {"order_id": order["id"], "action": action})
+        with server.connect() as db:
+            db.execute("UPDATE am_orders SET otp_expires=? WHERE id=?", (int(time.time()) - 1, order["id"]))
+        expired = self.request("/api/am/rider/status", "POST", {"order_id": order["id"], "action": "complete", "otp": order["delivery_code"]}, expected=403)
+        self.assertIn("expired", expired["error"].lower())
+        wrong_code = f"{(int(order['delivery_code']) + 1) % 1_000_000:06d}"
+        with server.connect() as db:
+            db.execute("UPDATE am_orders SET otp_expires=? WHERE id=?", (int(time.time()) + 120, order["id"]))
+        for _ in range(5):
+            self.request("/api/am/rider/status", "POST", {"order_id": order["id"], "action": "complete", "otp": wrong_code}, expected=403)
+        locked = self.request("/api/am/rider/status", "POST", {"order_id": order["id"], "action": "complete", "otp": order["delivery_code"]}, expected=403)
+        self.assertIn("locked", locked["error"].lower())
+        with server.connect() as db:
+            row = db.execute("SELECT status,otp_attempts FROM am_orders WHERE id=?", (order["id"],)).fetchone()
+            self.assertEqual(row["status"], "en_route")
+            self.assertEqual(row["otp_attempts"], 5)
+
+    def test_ordered_customer_code_is_not_in_operator_order_responses(self):
+        order = self.place_order(key="otp-serialization")
+        self.login("operator@example.test")
+        admin_orders = self.request("/api/am/admin/orders")["items"]
+        selected = next(o for o in admin_orders if o["id"] == order["id"])
+        self.assertNotIn("delivery_code", selected)
+        self.assertNotIn("delivery_otp_hash", selected)
+        self.assertNotIn("delivery_otp_ciphertext", selected)
 
     def test_shop_isolation_and_rejected_order_restock(self):
         order = self.place_order()
@@ -265,12 +378,14 @@ class MarketplaceIntegration(unittest.TestCase):
         self.login("rider@example.test")
         self.request("/api/am/rider/status", "POST", {"order_id": order["id"], "action": "picked_up"})
         self.request("/api/am/rider/status", "POST", {"order_id": order["id"], "action": "en_route"})
+        self.request("/api/am/rider/status", "POST", {"order_id": order["id"], "action": "complete", "otp": order["delivery_code"]})
         with server.connect() as db:
-            db.execute("UPDATE am_orders SET delivery_otp_hash=?,otp_expires=? WHERE id=?", (hashlib.sha256(b"123456").hexdigest(), int(time.time()) + 120, order["id"]))
-        self.request("/api/am/rider/status", "POST", {"order_id": order["id"], "action": "complete", "otp": "123456"})
-        with server.connect() as db:
-            status = db.execute("SELECT status FROM am_orders WHERE id=?", (order["id"],)).fetchone()[0]
-            self.assertEqual(status, "delivered")
+            delivered = db.execute("SELECT status FROM am_orders WHERE id=?", (order["id"],)).fetchone()
+            self.assertEqual(delivered["status"], "delivered")
+            stamp = db.execute("SELECT delivered_at FROM am_deliveries WHERE order_id=?", (order["id"],)).fetchone()[0]
+            audit = db.execute("SELECT details FROM am_audit WHERE action='delivery_code_verified' AND entity_id=?", (order["public_id"],)).fetchone()
+            self.assertIsNotNone(stamp)
+            self.assertEqual(json.loads(audit["details"]), {"result": "verified"})
 
 
 if __name__ == "__main__":
