@@ -2,7 +2,10 @@ FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HOST=0.0.0.0
+    HOST=0.0.0.0 \
+    APP_ENV=demo \
+    AMNOX_DB_PATH=/tmp/amnox-demo.sqlite3 \
+    AMNOX_SEED_DEMO_DATA=true
 
 WORKDIR /app
 RUN useradd --system --uid 10001 --no-create-home amnox \
