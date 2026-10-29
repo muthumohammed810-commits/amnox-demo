@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: amnox-demo
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: APP_ENV
+        value: demo
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 10000
+      - key: AMNOX_DB_PATH
+        value: /data/amnox-demo.sqlite3
+      - key: AMNOX_SEED_DEMO_DATA
+        value: "true"

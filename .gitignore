@@ -1,0 +1,57 @@
+# Local databases, backups, exports, uploads, and customer/order data
+data/
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.db
+*.db-*
+*.bak
+backups/
+exports/
+uploads/
+media/
+customer-data/
+order-data/
+
+# Environment configuration and credentials (keep only the safe template)
+.env*
+!.env.example
+.secrets/
+secrets.*
+credentials.*
+*credentials*.json
+*service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+
+# Tokens and local platform/CLI auth state
+.vercel/
+.render/
+.railway/
+.config/gh/
+auth.json
+token.txt
+*.token
+
+# Python, test, tool, and build caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+build/
+dist/
+*.log
+*.tmp
+*.swp
+Thumbs.db
+Desktop.ini

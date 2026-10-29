@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+data/
+__pycache__/
+*.py[cod]
+test_amnoX.py
+README.md
+IMPLEMENTATION.md
