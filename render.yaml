@@ -14,6 +14,6 @@ services:
       - key: PORT
         value: 10000
       - key: AMNOX_DB_PATH
-        value: /data/amnox-demo.sqlite3
+        value: /tmp/amnox-demo.sqlite3
       - key: AMNOX_SEED_DEMO_DATA
         value: "true"

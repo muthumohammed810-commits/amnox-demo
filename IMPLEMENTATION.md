@@ -38,6 +38,7 @@
 - [x] Add production fail-closed environment settings, secure cookies/security headers, POST origin checks, direct portal route authorization, basic login throttling, and versioned additive SQLite migrations.
 - [x] Add a provider-neutral container image and persistent-volume entrypoint; exclude local data and secrets from the image build context.
 - [x] Add a Render Free DEMO ONLY Blueprint using a new ephemeral SQLite path, synthetic catalog data, `/api/health`, and server-side rejection of sign-ups, shop applications, and orders.
+- [x] Fix Render startup permissions: make /app writable for the non-root container user and store only disposable demo SQLite data in writable /tmp.
 - [ ] Connect an authorized Render account to a Git repository containing this workspace, create the Blueprint service, deploy, and verify public routes. No Render account/source connection is available in this workspace.
 - [ ] Before accepting real orders, replace the DEMO ONLY service with paid durable storage or managed PostgreSQL; configure production secrets, verified accounts, rate limiting, backups, and complete security review. Do not upload the local database to the free demo.
 - [ ] External security review, password recovery/email verification, distributed rate limiting, automated backup/restore drills, managed PostgreSQL migration, and a hardened production HTTP server stack.

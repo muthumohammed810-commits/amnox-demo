@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 RUN useradd --system --uid 10001 --no-create-home amnox \
     && mkdir -p /data \
-    && chown 10001:10001 /data
+    && chown 10001:10001 /data /app
 
 COPY server.py container-entrypoint.py ./
 COPY web ./web
